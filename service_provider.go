@@ -1259,8 +1259,31 @@ func (sp *ServiceProvider) validateAudienceRestriction(assertion *Assertion) err
 
 var errSignatureElementNotPresent = errors.New("signature element not present")
 
+// unboundedParentContext is like etreeutils.NSBuildParentContext, but starts from
+// EmptyNSContext to skip the default context's 1000-node traversal budget
+// (goxmldsig >= 1.6, GHSA-qhrp-hfff-vphr). That budget bounds SignedInfo
+// canonicalization inside dsig.Validate, which still applies; it is not meant
+// for detaching a whole Response/Assertion, which can legitimately have far
+// more nodes (e.g. a large "groups" attribute). Ported from grafana/saml#89.
+func unboundedParentContext(el *etree.Element) (etreeutils.NSContext, error) {
+	parent := el.Parent()
+	if parent == nil {
+		return etreeutils.EmptyNSContext, nil
+	}
+
+	ctx, err := unboundedParentContext(parent)
+	if err != nil {
+		return ctx, err
+	}
+
+	return ctx.SubContext(parent)
+}
+
 // validateSignature returns nil iff the Signature embedded in the element is valid
 func (sp *ServiceProvider) validateSignature(el *etree.Element) error {
+	// el is reassigned by NSDetatch and is nil when it fails.
+	tag := el.Tag
+
 	sigEl, err := findChild(el, "http://www.w3.org/2000/09/xmldsig#", "Signature")
 	if err != nil {
 		return err
@@ -1320,17 +1343,17 @@ func (sp *ServiceProvider) validateSignature(el *etree.Element) error {
 		}
 	}
 
-	ctx, err := etreeutils.NSBuildParentContext(el)
+	ctx, err := unboundedParentContext(el)
 	if err != nil {
-		return fmt.Errorf("cannot validate signature on %s: %v", el.Tag, err)
+		return fmt.Errorf("cannot validate signature on %s: %v", tag, err)
 	}
 	ctx, err = ctx.SubContext(el)
 	if err != nil {
-		return fmt.Errorf("cannot validate signature on %s: %v", el.Tag, err)
+		return fmt.Errorf("cannot validate signature on %s: %v", tag, err)
 	}
 	el, err = etreeutils.NSDetatch(ctx, el)
 	if err != nil {
-		return fmt.Errorf("cannot validate signature on %s: %v", el.Tag, err)
+		return fmt.Errorf("cannot validate signature on %s: %v", tag, err)
 	}
 
 	if sp.SignatureVerifier != nil {
@@ -1338,7 +1361,7 @@ func (sp *ServiceProvider) validateSignature(el *etree.Element) error {
 	}
 
 	if _, err := validationContext.Validate(el); err != nil {
-		return fmt.Errorf("cannot validate signature on %s: %v", el.Tag, err)
+		return fmt.Errorf("cannot validate signature on %s: %v", tag, err)
 	}
 
 	return nil
