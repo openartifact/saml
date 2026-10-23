@@ -727,6 +727,14 @@ func (ivr *InvalidResponseError) Error() string {
 	return "Authentication failed"
 }
 
+// Unwrap returns PrivateErr so errors.Is and errors.As can match the
+// sentinels (ErrSignatureInvalid, ErrExpired, ...) and ErrBadStatus.
+// Error() still returns the static string: the diagnostic text is only
+// exposed by callers that choose to read PrivateErr.
+func (ivr *InvalidResponseError) Unwrap() error {
+	return ivr.PrivateErr
+}
+
 // ErrBadStatus is returned when the assertion provided is valid but the
 // status code is not "urn:oasis:names:tc:SAML:2.0:status:Success".
 type ErrBadStatus struct {
@@ -883,15 +891,15 @@ func (sp *ServiceProvider) parseArtifactResponse(artifactResponseEl *etree.Eleme
 			return nil, retErr
 		}
 		if artifactResponse.InResponseTo != artifactRequestID {
-			retErr.PrivateErr = fmt.Errorf("`InResponseTo` does not match the artifact request ID (expected %s)", artifactRequestID)
+			retErr.PrivateErr = classify(ErrInResponseToMismatch, "`InResponseTo` does not match the artifact request ID (expected %s)", artifactRequestID)
 			return nil, retErr
 		}
 		if artifactResponse.IssueInstant.Add(MaxIssueDelay).Before(now) {
-			retErr.PrivateErr = fmt.Errorf("response IssueInstant expired at %s", artifactResponse.IssueInstant.Add(MaxIssueDelay))
+			retErr.PrivateErr = classify(ErrExpired, "response IssueInstant expired at %s", artifactResponse.IssueInstant.Add(MaxIssueDelay))
 			return nil, retErr
 		}
 		if artifactResponse.Issuer != nil && artifactResponse.Issuer.Value != sp.IDPMetadata.EntityID {
-			retErr.PrivateErr = fmt.Errorf("response Issuer does not match the IDP metadata (expected %q)", sp.IDPMetadata.EntityID)
+			retErr.PrivateErr = classify(ErrIssuerMismatch, "response Issuer does not match the IDP metadata (expected %q)", sp.IDPMetadata.EntityID)
 			return nil, retErr
 		}
 		if artifactResponse.Status.StatusCode.Value != StatusSuccess {
@@ -902,10 +910,10 @@ func (sp *ServiceProvider) parseArtifactResponse(artifactResponseEl *etree.Eleme
 
 	var signatureRequirement signatureRequirement
 	sigErr := sp.validateSignature(artifactResponseEl)
-	switch sigErr {
-	case nil:
+	switch {
+	case sigErr == nil:
 		signatureRequirement = signatureNotRequired
-	case errSignatureElementNotPresent:
+	case errors.Is(sigErr, ErrSignatureMissing):
 		signatureRequirement = signatureRequired
 	default:
 		retErr.PrivateErr = sigErr
@@ -989,7 +997,7 @@ func (sp *ServiceProvider) parseResponse(responseEl *etree.Element, possibleRequ
 	var responseHasSignature bool
 	if signatureRequirement == signatureRequired {
 		responseSignatureErr = sp.validateSignature(responseEl)
-		if responseSignatureErr != errSignatureElementNotPresent {
+		if !errors.Is(responseSignatureErr, ErrSignatureMissing) {
 			responseHasSignature = true
 		}
 
@@ -1011,7 +1019,7 @@ func (sp *ServiceProvider) parseResponse(responseEl *etree.Element, possibleRequ
 			// Historically, we checked against the SP's ACS URL instead of currentURL, which is usually the same but may differ in query params.
 			// To mitigate the risk of switching to comparing against currentURL, we still allow it if the ACS URL matches, even if the current URL doesn't.
 			if response.Destination != currentURL.String() && response.Destination != sp.AcsURL.String() {
-				return nil, fmt.Errorf("`Destination` does not match requested URL or AcsURL (destination %q, requested %q, acs %q)", response.Destination, currentURL.String(), sp.AcsURL.String())
+				return nil, classify(ErrDestinationMismatch, "`Destination` does not match requested URL or AcsURL (destination %q, requested %q, acs %q)", response.Destination, currentURL.String(), sp.AcsURL.String())
 			}
 		}
 
@@ -1020,10 +1028,10 @@ func (sp *ServiceProvider) parseResponse(responseEl *etree.Element, possibleRequ
 		}
 
 		if response.IssueInstant.Add(MaxIssueDelay).Before(now) {
-			return nil, fmt.Errorf("response IssueInstant expired at %s", response.IssueInstant.Add(MaxIssueDelay))
+			return nil, classify(ErrExpired, "response IssueInstant expired at %s", response.IssueInstant.Add(MaxIssueDelay))
 		}
 		if response.Issuer != nil && response.Issuer.Value != sp.IDPMetadata.EntityID {
-			return nil, fmt.Errorf("response Issuer does not match the IDP metadata (expected %q)", sp.IDPMetadata.EntityID)
+			return nil, classify(ErrIssuerMismatch, "response Issuer does not match the IDP metadata (expected %q)", sp.IDPMetadata.EntityID)
 		}
 		if response.Status.StatusCode.Value != StatusSuccess {
 			return nil, ErrBadStatus{Status: response.Status.StatusCode.Value}
@@ -1031,11 +1039,11 @@ func (sp *ServiceProvider) parseResponse(responseEl *etree.Element, possibleRequ
 	}
 
 	if signatureRequirement == signatureRequired {
-		switch responseSignatureErr {
-		case nil:
+		switch {
+		case responseSignatureErr == nil:
 			// since the request has a signature, none of the Assertions need one
 			signatureRequirement = signatureNotRequired
-		case errSignatureElementNotPresent:
+		case errors.Is(responseSignatureErr, ErrSignatureMissing):
 			// the request has no signature, so assertions must be signed
 			signatureRequirement = signatureRequired // nop
 		default:
@@ -1094,7 +1102,10 @@ func (sp *ServiceProvider) parseResponse(responseEl *etree.Element, possibleRequ
 
 func (sp *ServiceProvider) validateRequestID(response Response, possibleRequestIDs []string) error {
 	if sp.ValidateRequestID != nil {
-		return sp.ValidateRequestID(response, possibleRequestIDs)
+		if err := sp.ValidateRequestID(response, possibleRequestIDs); err != nil {
+			return classifyCause(ErrInResponseToMismatch, err, "%v", err)
+		}
+		return nil
 	}
 
 	requestIDvalid := false
@@ -1108,7 +1119,7 @@ func (sp *ServiceProvider) validateRequestID(response Response, possibleRequestI
 		}
 	}
 	if !requestIDvalid {
-		return fmt.Errorf("`InResponseTo` does not match any of the possible request IDs (expected %v)", possibleRequestIDs)
+		return classify(ErrInResponseToMismatch, "`InResponseTo` does not match any of the possible request IDs (expected %v)", possibleRequestIDs)
 	}
 	return nil
 }
@@ -1180,12 +1191,21 @@ func (sp *ServiceProvider) parseAssertion(assertionEl *etree.Element, possibleRe
 // should be done before calling this function).
 func (sp *ServiceProvider) validateAssertion(assertion *Assertion, possibleRequestIDs []string, now time.Time) error {
 	if assertion.IssueInstant.Add(MaxIssueDelay).Before(now) {
-		return fmt.Errorf("expired on %s", assertion.IssueInstant.Add(MaxIssueDelay))
+		return classify(ErrExpired, "expired on %s", assertion.IssueInstant.Add(MaxIssueDelay))
 	}
 	if assertion.Issuer.Value != sp.IDPMetadata.EntityID {
-		return fmt.Errorf("issuer is not %q", sp.IDPMetadata.EntityID)
+		return classify(ErrIssuerMismatch, "issuer is not %q", sp.IDPMetadata.EntityID)
+	}
+	if assertion.Subject == nil {
+		return errors.New("assertion has no Subject")
+	}
+	if assertion.Conditions == nil {
+		return errors.New("assertion has no Conditions")
 	}
 	for _, subjectConfirmation := range assertion.Subject.SubjectConfirmations {
+		if subjectConfirmation.SubjectConfirmationData == nil {
+			return errors.New("assertion SubjectConfirmation has no SubjectConfirmationData")
+		}
 		requestIDvalid := false
 
 		// We *DO NOT* validate InResponseTo when AllowIDPInitiated is set. Here's why:
@@ -1213,21 +1233,21 @@ func (sp *ServiceProvider) validateAssertion(assertion *Assertion, possibleReque
 				}
 			}
 			if !requestIDvalid {
-				return fmt.Errorf("assertion SubjectConfirmation one of the possible request IDs (%v)", possibleRequestIDs)
+				return classify(ErrInResponseToMismatch, "assertion SubjectConfirmation one of the possible request IDs (%v)", possibleRequestIDs)
 			}
 		}
 		if subjectConfirmation.SubjectConfirmationData.Recipient != sp.AcsURL.String() {
-			return fmt.Errorf("assertion SubjectConfirmation Recipient is not %s", sp.AcsURL.String())
+			return classify(ErrRecipientMismatch, "assertion SubjectConfirmation Recipient is not %s", sp.AcsURL.String())
 		}
 		if subjectConfirmation.SubjectConfirmationData.NotOnOrAfter.Add(MaxClockSkew).Before(now) {
-			return fmt.Errorf("assertion SubjectConfirmationData is expired")
+			return classify(ErrExpired, "assertion SubjectConfirmationData is expired")
 		}
 	}
 	if assertion.Conditions.NotBefore.Add(-MaxClockSkew).After(now) {
-		return fmt.Errorf("assertion Conditions is not yet valid")
+		return classify(ErrNotYetValid, "assertion Conditions is not yet valid")
 	}
 	if assertion.Conditions.NotOnOrAfter.Add(MaxClockSkew).Before(now) {
-		return fmt.Errorf("assertion Conditions is expired")
+		return classify(ErrExpired, "assertion Conditions is expired")
 	}
 
 	if err := sp.validateAudienceRestriction(assertion); err != nil {
@@ -1239,7 +1259,7 @@ func (sp *ServiceProvider) validateAssertion(assertion *Assertion, possibleReque
 func (sp *ServiceProvider) validateAudienceRestriction(assertion *Assertion) error {
 	if sp.ValidateAudienceRestriction != nil {
 		if err := sp.ValidateAudienceRestriction(assertion); err != nil {
-			return fmt.Errorf("audience restriction validation failed: %w", err)
+			return classifyCause(ErrAudienceMismatch, err, "audience restriction validation failed: %v", err)
 		}
 		return nil
 	}
@@ -1252,12 +1272,10 @@ func (sp *ServiceProvider) validateAudienceRestriction(assertion *Assertion) err
 		}
 	}
 	if !audienceRestrictionsValid {
-		return fmt.Errorf("assertion Conditions AudienceRestriction does not contain %q", audience)
+		return classify(ErrAudienceMismatch, "assertion Conditions AudienceRestriction does not contain %q", audience)
 	}
 	return nil
 }
-
-var errSignatureElementNotPresent = errors.New("signature element not present")
 
 // unboundedParentContext is like etreeutils.NSBuildParentContext, but starts from
 // EmptyNSContext to skip the default context's 1000-node traversal budget
@@ -1279,8 +1297,19 @@ func unboundedParentContext(el *etree.Element) (etreeutils.NSContext, error) {
 	return ctx.SubContext(parent)
 }
 
-// validateSignature returns nil iff the Signature embedded in the element is valid
+// validateSignature returns nil iff the Signature embedded in the element is
+// valid. A missing Signature yields ErrSignatureMissing; every other failure
+// matches ErrSignatureInvalid with errors.Is.
 func (sp *ServiceProvider) validateSignature(el *etree.Element) error {
+	err := sp.validateSignatureUnclassified(el)
+	if err == nil || errors.Is(err, ErrSignatureMissing) || errors.Is(err, ErrSignatureInvalid) {
+		return err
+	}
+
+	return classifyCause(ErrSignatureInvalid, err, "%v", err)
+}
+
+func (sp *ServiceProvider) validateSignatureUnclassified(el *etree.Element) error {
 	// el is reassigned by NSDetatch and is nil when it fails.
 	tag := el.Tag
 
@@ -1289,7 +1318,7 @@ func (sp *ServiceProvider) validateSignature(el *etree.Element) error {
 		return err
 	}
 	if sigEl == nil {
-		return errSignatureElementNotPresent
+		return ErrSignatureMissing
 	}
 
 	var certs []*x509.Certificate
